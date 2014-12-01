@@ -15,24 +15,44 @@
  */
 package su.litvak.chromecast.api.v2;
 
-import com.google.protobuf.InvalidProtocolBufferException;
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.security.GeneralSecurityException;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+
 import org.codehaus.jackson.map.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import java.io.Closeable;
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.security.GeneralSecurityException;
-import java.security.SecureRandom;
-import java.net.Socket;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import su.litvak.chromecast.api.v2.CastChannel.AuthResponse;
+
+import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * Internal class for low-level communication with ChromeCast device. Should
@@ -40,7 +60,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * methods instead
  */
 class Channel implements Closeable {
+
 	private static final Logger LOG = LoggerFactory.getLogger(Channel.class);
+
+	private static KeyStore keyStore;
+	static {
+		try {
+			keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+			TrustManagerFactory.getInstance("X509").init(keyStore);
+		} catch (KeyStoreException e) {
+			LOG.error("Can't initialize keystore common to all Channels", e);
+		} catch (NoSuchAlgorithmException e) {
+			LOG.error("Can't initialize TrustManagerFactory with keystore", e);
+		}
+	}
 	/**
 	 * Period for sending ping requests (in ms)
 	 */
@@ -55,11 +88,15 @@ class Channel implements Closeable {
 	/**
 	 * Single socket instance for transfers
 	 */
-	private final Socket socket;
+	private Socket socket;
 	/**
 	 * Name of sender used in this channel
 	 */
 	private final String name;
+
+	private String host;
+
+	private int port;
 	/**
 	 * Timer for PING requests
 	 */
@@ -173,18 +210,20 @@ class Channel implements Closeable {
 	}
 
 	Channel(String host, int port) throws IOException, GeneralSecurityException {
-		SSLContext sc = SSLContext.getInstance("SSL");
-		sc.init(null, new TrustManager[] { new X509TrustAllManager() },
-				new SecureRandom());
-		this.socket = sc.getSocketFactory().createSocket(host, port);
+		this.host = host;
+		this.port = port;
 		this.name = "sender-" + new RandomString(10).nextString();
 		connect();
 	}
 
 	/**
 	 * Establish connection to the ChromeCast device
+	 * 
+	 * @throws KeyManagementException
+	 * @throws NoSuchAlgorithmException
 	 */
-	private void connect() throws IOException {
+	private void connect() throws IOException, KeyManagementException,
+			NoSuchAlgorithmException {
 		/**
 		 * Authenticate
 		 */
@@ -207,10 +246,23 @@ class Channel implements Closeable {
 		CastChannel.CastMessage response = read();
 		CastChannel.DeviceAuthMessage authResponse = CastChannel.DeviceAuthMessage
 				.parseFrom(response.getPayloadBinary());
+		TrustManager[] trustManagers = null;
+		try {
+			extractCertificates(authResponse);
+			trustManagers = TrustManagerFactory.getInstance("X509")
+					.getTrustManagers();
+		} catch (Exception e) {
+			LOG.warn("Can't extract certificates to verify connection, trusting all certificates now");
+			trustManagers = new TrustManager[] { new X509TrustAllManager() };
+		}
 		if (authResponse.hasError()) {
 			throw new IOException("Authentication failed: "
 					+ authResponse.getError().getErrorType().toString());
 		}
+
+		SSLContext sc = SSLContext.getInstance("SSL");
+		sc.init(null, trustManagers, new SecureRandom());
+		this.socket = sc.getSocketFactory().createSocket(host, port);
 
 		/**
 		 * Send 'PING' message
@@ -232,6 +284,41 @@ class Channel implements Closeable {
 
 		reader = new ReadThread();
 		reader.start();
+	}
+
+	private KeyStore extractCertificates(
+			CastChannel.DeviceAuthMessage deviceAuthMessage)
+			throws KeyStoreException, CertificateException {
+		if (deviceAuthMessage.hasResponse()) {
+			ByteString rawClientCertificate = null;
+			List<ByteString> rawIntermediateCertificates = null;
+			AuthResponse authResponse = deviceAuthMessage.getResponse();
+			if (authResponse.hasClientAuthCertificate()) {
+				rawClientCertificate = authResponse.getClientAuthCertificate();
+				addCertToKeyStore(keyStore, rawClientCertificate);
+			}
+			if (authResponse.getIntermediateCertificateCount() > 0) {
+				rawIntermediateCertificates = authResponse
+						.getIntermediateCertificateList();
+				for (ByteString rawCert : rawIntermediateCertificates) {
+					addCertToKeyStore(keyStore, rawCert);
+				}
+
+			}
+		}
+
+		return keyStore;
+	}
+
+	private void addCertToKeyStore(KeyStore store, ByteString rawCert)
+			throws CertificateException, KeyStoreException {
+		CertificateFactory certFactory = CertificateFactory
+				.getInstance("X.509");
+		X509Certificate clientCert = (X509Certificate) certFactory
+				.generateCertificate(new ByteArrayInputStream(rawCert
+						.asReadOnlyByteBuffer().array()));
+		store.setCertificateEntry(clientCert.getIssuerX500Principal().getName()
+				+ clientCert.getSerialNumber(), clientCert);
 	}
 
 	private <T extends Response> T send(String namespace, Request message,
